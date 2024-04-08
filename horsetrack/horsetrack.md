@@ -129,7 +129,7 @@ alert I gave when talking about remove_horse, as this is the work around.
 ![image](https://user-images.githubusercontent.com/96510931/228070309-84e2104d-ef63-4d1d-bc95-19ad37ea5cf4.png)
 
 
-## The exploitation beings
+## The exploitation begins
 
 With all that, we can begin thinking about how we will exploit this. I will be attempting to pop a shell. My high level approach will
 consist of:
